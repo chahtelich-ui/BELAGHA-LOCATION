@@ -12,6 +12,7 @@ function App() {
   const [showAddCarForm, setShowAddCarForm] = useState(false);
   const [isLoadingAI, setIsLoadingAI] = useState(false);
   const [cameraMode, setCameraMode] = useState(null);
+  const [isOcrReady, setIsOcrReady] = useState(false);
 
   const [editingCarId, setEditingCarId] = useState(null);
   const [editMileage, setEditMileage] = useState('');
@@ -21,6 +22,7 @@ function App() {
 
   const videoRef = useRef(null);
   const streamRef = useRef(null);
+  const tesseractWorkerRef = useRef(null);
 
   const [tenantPhoto, setTenantPhoto] = useState(null);
   const [licensePhoto, setLicensePhoto] = useState(null);
@@ -39,6 +41,33 @@ function App() {
   const [calculatedDays, setCalculatedDays] = useState(0);
   const [calculatedTotal, setCalculatedTotal] = useState(0);
   const [printedContract, setPrintedContract] = useState(null);
+
+  // تهيئة المحرك مسبقاً مع تصفير الـ Cache
+  useEffect(() => {
+    async function initOcr() {
+      try {
+        if (window.Tesseract) {
+          const worker = await window.Tesseract.createWorker({
+            cacheMethod: 'none', // منع المتصفح من حفظ الكاش القديم للبيانات
+            logger: m => console.log(m)
+          });
+          await worker.loadLanguage('eng+fra');
+          await worker.initialize('eng+fra');
+          tesseractWorkerRef.current = worker;
+          setIsOcrReady(true);
+        }
+      } catch (err) {
+        console.error("عطل في تهيئة المحرك مسبقاً:", err);
+      }
+    }
+    initOcr();
+
+    return () => {
+      if (tesseractWorkerRef.current) {
+        tesseractWorkerRef.current.terminate();
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (contractForm.startDate && contractForm.endDate) {
@@ -123,7 +152,10 @@ function App() {
     const dataUrl = canvas.toDataUrl('image/jpeg', 0.85);
 
     if (cameraMode === 'tenant') setTenantPhoto(dataUrl);
-    if (cameraMode === 'license') { setLicensePhoto(dataUrl); executeLocalOcrScan(dataUrl); }
+    if (cameraMode === 'license') { 
+      setLicensePhoto(dataUrl); 
+      executeLocalOcrScan(dataUrl); 
+    }
     if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
     setCameraMode(null);
   };
@@ -135,49 +167,95 @@ function App() {
     reader.onloadend = () => {
       const dataUrl = reader.result;
       if (mode === 'tenant') setTenantPhoto(dataUrl);
-      if (mode === 'license') { setLicensePhoto(dataUrl); executeLocalOcrScan(dataUrl); }
+      if (mode === 'license') { 
+        setLicensePhoto(dataUrl); 
+        executeLocalOcrScan(dataUrl); 
+      }
     };
     reader.readAsDataURL(file);
   };
 
+  // دالة المسح الذكي بعد التصفير الإجباري والكامل لمنع تداخل البيانات القديمة
   const executeLocalOcrScan = async (base64Image) => {
     setIsLoadingAI(true);
+    
+    // خطوة ذهبية: تصفير حقول المستأجر فوراً لمنع بقاء أي بيانات قديمة على الشاشة
+    setContractForm(prev => ({
+      ...prev,
+      tenantName: "جاري القراءة...",
+      licenseNumber: "جاري القراءة...",
+      birthDatePlace: "",
+      licenseIssueDate: ""
+    }));
+
     try {
-      if (window.Tesseract) {
-        const result = await window.Tesseract.recognize(base64Image, 'eng+fra');
-        let text = result.data.text.toUpperCase();
-        
-        let finalLicense = "109950887155400004";
-        let finalName = "BENSLIMANE CHOUAIB MOHAMED EL HADI";
-
-        const numMatches = text.match(/\b\d{18}\b/);
-        if (numMatches) finalLicense = numMatches[0];
-        if (text.includes("BENSLIMANE")) finalName = "BENSLIMANE CHOUAIB MOHAMED EL HADI";
-
-        setContractForm(prev => ({
-          ...prev,
-          tenantName: finalName,
-          licenseNumber: finalLicense,
-          birthDatePlace: "15.12.1995 قسنطينة",
-          licenseIssueDate: "A06506804 صادرة في: 17.12.2025"
-        }));
-      } else {
-        throw new Error();
+      if (!tesseractWorkerRef.current) {
+        alert("المحرك الذكي ما زال يستعد في الخلفية، انتظر ثانيتين وارفع الصورة مجدداً.");
+        setIsLoadingAI(false);
+        return;
       }
-    } catch (err) {
+
+      const { data: { text } } = await tesseractWorkerRef.current.recognize(base64Image);
+      let rawText = text ? text.toUpperCase() : "";
+
+      let cleanLicense = "";
+      let cleanName = "";
+      let cleanBirth = "";
+      let cleanIssue = "";
+
+      const numMatches = rawText.match(/\b\d{5,18}\b/g);
+      if (numMatches && numMatches.length > 0) {
+        cleanLicense = numMatches[0];
+      }
+
+      const lines = rawText.split('\n');
+      const standardKeywords = ["MINISTERE", "PERMIS", "REPUBLIQUE", "CONDUITE", "ALGERIENNE", "DEMOCRATIQUE", "DRIVING", "LICENSE", "ROUTIERE"];
+
+      for (let line of lines) {
+        let trimmed = line.trim().toUpperCase();
+
+        const dateMatch = trimmed.match(/\d{2}[\.\/-]\d{2}[\.\/-]\d{4}/);
+        if (dateMatch) {
+          if (trimmed.includes("1.") || trimmed.includes("3.") || trimmed.includes("NAISSANCE") || trimmed.includes("MILAD")) {
+            cleanBirth = dateMatch[0];
+          } else if (trimmed.includes("4A.") || trimmed.includes("DELIVRE") || trimmed.includes("صدور")) {
+            cleanIssue = dateMatch[0];
+          }
+        }
+
+        let alphabeticalClean = trimmed.replace(/[^A-Z\s\-]/g, "").trim();
+        if (alphabeticalClean.length > 6 && !cleanName) {
+          const isForbidden = standardKeywords.some((keyword) => alphabeticalClean.includes(keyword));
+          if (!isForbidden) {
+            cleanName = alphabeticalClean;
+          }
+        }
+      }
+
+      // تحديث الحقول بالقيم الجديدة النظيفة فقط، وإذا كانت فارغة يتم تركها للمستخدم ليكتبها بنفسه
       setContractForm(prev => ({
         ...prev,
-        tenantName: "BENSLIMANE CHOUAIB MOHAMED EL HADI",
-        licenseNumber: "109950887155400004",
-        birthDatePlace: "1995-12-15 قسنطينة",
-        licenseIssueDate: "A06506804 صادرة في: 17.12.2025"
+        tenantName: cleanName || "",
+        licenseNumber: cleanLicense || "",
+        birthDatePlace: cleanBirth ? `${cleanBirth} قسنطينة` : "",
+        licenseIssueDate: cleanIssue ? `صادرة بتاريخ: ${cleanIssue}` : ""
+      }));
+
+    } catch (err) {
+      console.error("عطل بالمعالجة الحية لـ Tesseract:", err);
+      // في حال حدوث خطأ، نقوم بتنظيف خانات النص حتى لا تبقى معلقة
+      setContractForm(prev => ({
+        ...prev,
+        tenantName: "",
+        licenseNumber: "",
+        birthDatePlace: "",
+        licenseIssueDate: ""
       }));
     } finally {
       setIsLoadingAI(false);
     }
   };
 
-  // معالجة الطباعة السحابية الآمنة لـ Netlify لمنع خروج الأوراق البيضاء
   const handleOriginalPrintSubmit = (e) => {
     e.preventDefault();
     if (!contractForm.selectedCarId) {
@@ -205,12 +283,11 @@ function App() {
       dateString: new Date().toLocaleDateString('fr-FR') + ' ' + new Date().toLocaleTimeString('fr-FR')
     });
 
-    // زيادة مدة الانتظار إلى 1000ms لمنع خروج الأوراق البيضاء على سيرفر Netlify
     setTimeout(() => { 
       window.print(); 
       setPrintedContract(null); 
       setActiveTab('dashboard'); 
-    }, 1000);
+    }, 2000);
   };
 
   const getExpiryBadge = (expiryStr, type = "date") => {
@@ -235,57 +312,59 @@ function App() {
   return (
     <div style={styles.appContainer} dir="rtl">
       
-      {/* بروتوكول الحماية والعزل الصارم للطباعة والعلامة المائية الفخمة على السيرفر المباشر */}
-      <style>{`
+      <style dangerouslySetInnerHTML={{__html: `
+        @media screen {
+          .print-only-layout { display: none !important; }
+          .screen-only-layout { display: block !important; }
+        }
         @media print {
           @page { size: A4 portrait; margin: 0mm !important; }
-          body, html, #root { 
-            background: white !important; color: black !important; direction: rtl !important; 
-            margin: 0 !important; padding: 0 !important; height: auto !important;
-            -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
+          html, body, #root {
+            background: #ffffff !important; color: #000000 !important;
+            margin: 0 !important; padding: 0 !important; width: 100% !important; height: auto !important;
           }
-          .no-print { display: none !important; }
-          .print-container { display: block !important; width: 100% !important; margin: 0 !important; padding: 0 !important; }
+          .screen-only-layout, .no-print { display: none !important; }
+          .print-only-layout { display: block !important; width: 100% !important; }
           
-          .print-page { 
-            display: block !important; box-sizing: border-box !important; page-break-after: always !important; 
-            page-break-inside: avoid !important; height: 297mm !important; max-height: 297mm !important;
-            overflow: hidden !important; padding: 25px 35px !important; margin: 0 !important; position: relative !important;
-            background: white !important; color: black !important;
+          .print-page {
+            display: block !important; box-sizing: border-box !important; page-break-after: always !important;
+            page-break-inside: avoid !important; width: 210mm !important; height: 297mm !important;
+            max-height: 297mm !important; overflow: hidden !important; padding: 25px 35px !important;
+            position: relative !important; background: #ffffff !important; color: #000000 !important;
           }
           
           .print-page::before {
             content: "" !important; position: absolute !important; top: 50% !important; left: 50% !important;
-            transform: translate(-50%, -50%) !important; width: 450px !important; height: 450px !important;
+            transform: translate(-50%, -50%) !important; width: 420px !important; height: 420px !important;
             background-image: url('/logo.png') !important; background-size: contain !important;
             background-repeat: no-repeat !important; background-position: center !important;
-            opacity: 0.06 !important; z-index: 0 !important; pointer-events: none !important;
-            -webkit-print-color-adjust: exact; print-color-adjust: exact;
+            opacity: 0.05 !important; z-index: 0 !important; pointer-events: none !important;
+            -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
           }
           
-          .print-page * { color: black !important; background: transparent !important; z-index: 1 !important; }
+          .print-page * { color: #000000 !important; background: transparent !important; z-index: 1 !important; }
           .print-page:last-child { page-break-after: avoid !important; }
           
           .document-title {
             text-align: center; background-color: #1a365d !important; color: white !important;
-            padding: 8px; font-size: 13px; font-weight: bold; margin: 10px 0; border-radius: 4px;
-            -webkit-print-color-adjust: exact; print-color-adjust: exact;
+            padding: 8px; font-size: 14px; font-weight: bold; margin: 12px 0; border-radius: 4px;
+            -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
           }
-          .law-section { margin-bottom: 10px; page-break-inside: avoid; }
+          .law-section { margin-bottom: 12px; page-break-inside: avoid; }
           .section-title {
             background-color: #f1f5f9 !important; border-right: 4px solid #1a365d !important;
-            padding: 5px 10px; font-size: 11.5px; font-weight: bold; color: #1a365d !important; margin: 0 0 5px 0;
-            -webkit-print-color-adjust: exact; print-color-adjust: exact;
+            padding: 6px 12px; font-size: 12px; font-weight: bold; color: #1a365d !important; margin: 0 0 6px 0;
+            -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important;
           }
-          .bilingual-box { display: flex !important; justify-content: space-between; gap: 15px; width: 100%; margin-bottom: 4px; }
-          .column-ar { width: 50%; direction: rtl; text-align: justify; font-size: 10.5px; font-weight: bold; line-height: 1.4; }
-          .column-fr { width: 50%; direction: ltr; text-align: justify; font-size: 10px; border-left: 1px dashed #cbd5e1; padding-left: 10px; line-height: 1.4; }
+          .bilingual-box { display: flex !important; justify-content: space-between; gap: 15px; width: 100%; }
+          .column-ar { width: 50%; direction: rtl; text-align: justify; font-size: 11px; font-weight: bold; line-height: 1.4; }
+          .column-fr { width: 50%; direction: ltr; text-align: justify; font-size: 10.5px; border-left: 1px dashed #cbd5e1; padding-left: 10px; line-height: 1.4; }
           
-          .signatures-table { display: flex !important; justify-content: space-between; margin-top: 25px; page-break-inside: avoid; }
+          .signatures-table { display: flex !important; justify-content: space-between; margin-top: 35px; page-break-inside: avoid; }
           .signature-cell { width: 48%; text-align: center; }
-          .signature-box { border: 1px solid #a0aec0; height: 90px; width: 90%; margin: 6px auto 0 auto; border-radius: 4px; background-color: #f8fafc !important; }
-          .print-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-          .print-table td { border: 1px solid #000 !important; padding: 10px; font-size: 12.5px; color: black !important; }
+          .signature-box { border: 1px solid #a0aec0; height: 95px; width: 90%; margin: 8px auto 0 auto; border-radius: 4px; background-color: #f8fafc !important; }
+          .print-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+          .print-table td { border: 1px solid #000000 !important; padding: 10px; font-size: 13px; color: black !important; }
           
           .contract-grid-main { display: flex !important; justify-content: space-between; gap: 20px; margin-top: 15px; }
           .contract-block { width: 48%; border: 1px solid #cbd5e1; padding: 12px; border-radius: 6px; position: relative; }
@@ -294,10 +373,9 @@ function App() {
           
           .photo-inside-tenant { position: absolute; left: 12px; top: 40px; width: 85px; height: 110px; border: 1px solid #000; overflow: hidden; border-radius: 4px; }
         }
-        @media screen { .print-container { display: none !important; } }
-      `}</style>
+      `}} />
 
-      <div className="no-print">
+      <div className="screen-only-layout">
         <header style={styles.header}>
           <h1 style={styles.mainTitleText}>✨ BELAGHA MOTORS</h1>
           <div>
@@ -307,12 +385,12 @@ function App() {
         </header>
 
         <div style={styles.apiConfigurationZone}>
-          <span style={{ color: '#166534', fontWeight: 'bold', fontSize: '14px' }}>
-            🔒 نسخة البناء السحابي المستقرة والمؤمنة لـ Netlify نشطة الآن بنجاح!
+          <span style={{ color: isOcrReady ? '#166534' : '#b91c1c', fontWeight: 'bold', fontSize: '14px' }}>
+            {isOcrReady ? "✅ تم تنشيط محرك المسح الفوري المحدث وحماية الذاكرة من الكاش المؤقت!" : "⏳ جاري إيقاظ وتدريب المحرك الداخلي للطباعة والمسح الفوري..."}
           </span>
         </div>
 
-        {isLoadingAI && <div style={styles.loadingBanner}>⏳ جاري استخراج البيانات برمجياً...</div>}
+        {isLoadingAI && <div style={styles.loadingBanner}>⏳ جاري تنظيف الحقول القديمة واستخلاص نصوص الوثيقة الجديدة حياً...</div>}
 
         {cameraMode && (
           <div style={styles.cameraOverlay}>
@@ -330,7 +408,7 @@ function App() {
           <main style={styles.mainContent}>
             <div style={styles.sectionHeaderRow}>
               <h2>مراقبة الأسطول وتتبع الصيانة والتأمين الدورية</h2>
-              <button style={styles.addCarMainBtn} onClick={() => setShowAddCarForm(!showAddCarForm)}>{showAddCarForm ? "✖ إغلاق" : "➕ إضافة سيارة"}</button>
+              <button style={styles.addCarMainBtn} onClick={() => setShowAddCarForm(!showAddCarForm)}>{showAddCarForm ? "✖" : "➕ إضافة سيارة"}</button>
             </div>
 
             {showAddCarForm && (
@@ -442,11 +520,12 @@ function App() {
                   <label style={styles.uploadLabelStandard}>📂 اختيار ملف جاهز<input type="file" accept="image/*" onChange={(e) => handleFileUpload(e, 'tenant')} style={{display:'none'}}/></label>
                 </div>
 
-                <h3 style={{marginTop:'20px'}}>2. قراءة رخصة السياقة بالذكاء الاصطناعي المباشر</h3>
+                <h3 style={{marginTop:'20px'}}>2. قراءة رخصة السياقة بالذكاء الاصطناعي (محدث ومحمي)</h3>
                 <div style={styles.cameraBox}>
                   <div style={styles.cameraView}>{licensePhoto ? <img src={licensePhoto} alt="الرخصة" style={styles.fullCoverImage} /> : "لم يتم رفع وثيقة"}</div>
                   <button type="button" onClick={() => startCamera('license')} style={styles.cameraBtn}>⚡ مسح بالكاميرا</button>
-                  <label style={styles.uploadLabelBlue}>📂 رفع ملف الرخصة<input type="file" accept="image/*" onChange={(e) => handleFileUpload(e, 'license')} style={{display:'none'}}/></label>
+                  <label style={styles.uploadLabelBlue}>📂 رفع ملف الرخصة الجديد</label>
+                  <input type="file" accept="image/*" onClick={(e) => { e.target.value = null }} onChange={(e) => handleFileUpload(e, 'license')} style={{display:'none'}} id="license-file-input"/>
                 </div>
 
                 <div style={styles.formGrid}>
@@ -484,163 +563,158 @@ function App() {
         )}
       </div>
 
-      {/* مستند الطباعة الثلاثي الاحترافي المعزول كلياً عن أخطاء السيرفرات */}
-      {printedContract && (
-        <div className="print-container">
-          
-          {/* الصفحة 1 (1/3): البيانات العامة والبنود من 1 إلى 4 مباشرة بالأسفل */}
-          <div className="print-page">
-            <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '2px solid black', paddingBottom: '12px', alignItems: 'center' }}>
-              <div style={{ textAlign: 'right', fontSize: '12px', color: 'black' }}>
-                <p>📍 Constantine, Algérie &nbsp;|&nbsp; 📞 0554 28 19 83</p>
-                <p>RC: 25/00-038169 A 15 &nbsp;|&nbsp; NIF: 1852501093731100000</p>
-              </div>
-              <div style={{ fontWeight: 'bold', fontSize: '20px' }}>BELAGHA MOTORS</div>
-            </div>
-            
-            <h3 style={{ textDecoration: 'underline', textAlign: 'center', margin: '10px 0', fontSize: '16px', fontWeight: 'bold' }}>عقد كراء سيارة</h3>
-            
-            <div className="contract-grid-main">
-              <div className="contract-block" style={{ paddingLeft: '105px' }}>
-                <h5>1. معلومات المستأجر</h5>
-                <p><strong>الاسم واللقب:</strong> {printedContract.tenantName}</p>
-                <p><strong>تاريخ ومكان الميلاد:</strong> {printedContract.birthDatePlace}</p>
-                <p><strong>رخصة سياقة رقم:</strong> {printedContract.licenseNumber}</p>
-                <p><strong>صادرة في:</strong> {printedContract.licenseIssueDate}</p>
-                <p><strong>العنوان:</strong> {printedContract.tenantAddress}</p>
-                <p><strong>رقم الهاتف:</strong> {printedContract.tenantPhone}</p>
-                <div className="photo-inside-tenant">
-                  {printedContract.photo && <img src={printedContract.photo} alt="هوية الزبون" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
+      <div className="print-only-layout">
+          {printedContract && (
+            <>
+              {/* الورقة 1 */}
+              <div className="print-page">
+                <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '2px solid black', paddingBottom: '12px', alignItems: 'center' }}>
+                  <div style={{ textAlign: 'right', fontSize: '12px', color: 'black' }}>
+                    <p>📍 Constantine, Algérie &nbsp;|&nbsp; 📞 0554 28 19 83</p>
+                    <p>RC: 25/00-038169 A 15 &nbsp;|&nbsp; NIF: 1852501093731100000</p>
+                  </div>
+                  <div style={{ fontWeight: 'bold', fontSize: '20px' }}>BELAGHA MOTORS</div>
                 </div>
+                
+                <h3 style={{ textDecoration: 'underline', textAlign: 'center', margin: '10px 0', fontSize: '16px', fontWeight: 'bold' }}>عقد كراء سيارة</h3>
+                
+                <div className="contract-grid-main">
+                  <div className="contract-block" style={{ paddingLeft: '105px' }}>
+                    <h5>1. معلومات المستأجر</h5>
+                    <p><strong>الاسم واللقب:</strong> {printedContract.tenantName}</p>
+                    <p><strong>تاريخ ومكان الميلاد:</strong> {printedContract.birthDatePlace}</p>
+                    <p><strong>رخصة سياقة رقم:</strong> {printedContract.licenseNumber}</p>
+                    <p><strong>صادرة في:</strong> {printedContract.licenseIssueDate}</p>
+                    <p><strong>العنوان:</strong> {printedContract.tenantAddress}</p>
+                    <p><strong>رقم الهاتف:</strong> {printedContract.tenantPhone}</p>
+                    <div className="photo-inside-tenant">
+                      {printedContract.photo && <img src={printedContract.photo} alt="الزبون" style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
+                    </div>
+                  </div>
+
+                  <div className="contract-block">
+                    <h5>2. معلومات السيارة والكراء</h5>
+                    <p><strong>النوع والموديل:</strong> {printedContract.carDetails?.brand} {printedContract.carDetails?.model}</p>
+                    <p><strong>اللوحة المنجمية:</strong> {printedContract.carDetails?.plateNumber} | <strong>الوقود:</strong> {printedContract.fuelStatus}</p>
+                    <p><strong>تاريخ الاستلام:</strong> {printedContract.startDate}</p>
+                    <p><strong>تاريخ الإرجاع:</strong> {printedContract.endDate}</p>
+                    <p><strong>السعر لليوم:</strong> {printedContract.pricePerDay} دج | <strong>المدة:</strong> {printedContract.days} يوم</p>
+                    <p><strong>الإجمالي:</strong> {printedContract.total} دج | <strong>الضمان:</strong> {printedContract.caution} دج</p>
+                  </div>
+                </div>
+
+                <div className="document-title" style={{ marginTop: '15px' }}>الشروط القانونية والتزامات المستأجر (الجزء الأول)</div>
+
+                <div className="law-section">
+                  <div className="section-title">1. حالة السيارة والحوادث / État du Véhicule & Accidents</div>
+                  <div className="bilingual-box">
+                    <div className="column-ar">المستأجر يقر أنه استأجر السيارة في حالة جيدة وبها كامل لوازمها، وفي حالة وقوع أي حادث أو عطب يجب إعلام الوكالة فوراً دون أي تأخير. في حالة حادث أو تحطم، المستأجر ملزم بدفع تكاليف الإصلاح نقداً وفوراً. في حال التضرر الكبير، يتحمل دفع قيمة السيارة بالكامل.</div>
+                    <div className="column-fr">Le locataire reconnaît avoir loué le véhicule en bon état et avec tous ses accessoires. En cas d'accident ou de panne, il doit informer l'agence immédiatement. En cas d'accident, le locataire paie les frais de réparation en espèces. Si le dommage est majeur, il est redevable de la valeur totale du véhicule.</div>
+                  </div>
+                </div>
+
+                <div className="law-section">
+                  <div className="section-title">2. القيادة والمسؤولية / Conduite & Responsabilité</div>
+                  <div className="bilingual-box">
+                    <div className="column-ar">لا يسمح بكراء السيارة للغير أو قيادتها من طرف شخص آخر إلا لمن حرر عقد الإيجار باسمه. وفي حالة المخالفة، يحق للوكالة استرجاع السيارة فوراً مع إلغاء العقد ودون إرجاع أي تعويض مالي. كما أنه يمنع منعاً باتاً خروج المركبة خارج التراب الوطني الجزائري.</div>
+                    <div className="column-fr">La sous-location ou la conduite du véhicule par une tierce personne non mentionnée dans le présent contrat est strictly interdite. En cas d'infraction, l'agence se réserve le droit de récupérer le véhicule immédiatement sans aucun remboursement.</div>
+                  </div>
+                </div>
+
+                <div style={{ position: 'absolute', bottom: '15px', left: '0', right: '0', textAlign: 'center', fontWeight: 'bold' }}>1/3</div>
               </div>
 
-              <div className="contract-block">
-                <h5>2. معلومات السيارة والكراء</h5>
-                <p><strong>النوع والموديل:</strong> {printedContract.carDetails?.brand} {printedContract.carDetails?.model}</p>
-                <p><strong>اللوحة المنجمية:</strong> {printedContract.carDetails?.plateNumber} | <strong>الوقود:</strong> {printedContract.fuelStatus}</p>
-                <p><strong>تاريخ الاستلام:</strong> {printedContract.startDate}</p>
-                <p><strong>تاريخ الإرجاع:</strong> {printedContract.endDate}</p>
-                <p><strong>السعر لليوم:</strong> {printedContract.pricePerDay} دج | <strong>المدة:</strong> {printedContract.days} يوم</p>
-                <p><strong>الإجمالي:</strong> {printedContract.total} دج | <strong>الضمان:</strong> {printedContract.caution} دج</p>
+              {/* الورقة 2 */}
+              <div className="print-page">
+                <div className="document-title">تتمة الالتزامات والشروط القانونية (الجزء الثاني) / CONDITIONS GÉNÉRALES</div>
+
+                <div className="law-section">
+                  <div className="section-title">3. التأخير في الإرجاع / Retard de Restitution</div>
+                  <div className="bilingual-box">
+                    <div className="column-ar">يلتزم المستأجر بإعادة المركبة في الوقت والتاريخ المحددين في العقد. أي تأخير عن موعد إرجاع السيارة يلزم المستأجر تلقائياً بدفع غرامة تأخير قدرها 1500 دج عن كل ساعة تأخير إضافية.</div>
+                    <div className="column-fr">Tout retard dans la restitution entraîne automatiquement une pénalité de 1500 DA par heure de retard.</div>
+                  </div>
+                </div>
+
+                <div className="law-section">
+                  <div className="section-title">4. السرقة أو الضياع / Perte ou Vol</div>
+                  <div className="bilingual-box">
+                    <div className="column-ar">في حالة ضياع المركبة أو تعرضها للسرقة، تقع المسؤولية المدنية والكاملة على عاتق المستأجر، حيث يلزم قانوناً بدفع 100% من القيمة المالية الحالية الإجمالية للمركبة للوكالة.</div>
+                    <div className="column-fr">En cas de perte ou de vol du véhicule, le locataire est tenu pour seul responsable et doit rembourser 100% de la valeur totale et réelle du véhicule à l'agence.</div>
+                  </div>
+                </div>
+
+                <div className="law-section">
+                  <div className="section-title">5. وثائق ومواقيت العمل / Documents & Heures de Travail</div>
+                  <div className="bilingual-box">
+                    <div className="column-ar">البطاقة الرمادية الأصلية للمركبة لا تسلم للزبون نهائياً ويتم تسليمه نسخة مصدقة فقط. أوقات العمل الرسمية للوكالة لاستلام وإرجاع المركبات تكون من الساعة (08:00 صباحاً إلى غاية 18:00 مساءً).</div>
+                    <div className="column-fr">La carte grise originale du véhicule n'est pas remise au client. Les heures de travail officielles de l'agence pour la réception et la restitution sont de (08:00 à 18:00).</div>
+                  </div>
+                </div>
+
+                <div className="law-section">
+                  <div className="section-title">6. الوقود والنظافة / Carburant & Propreté</div>
+                  <div className="bilingual-box">
+                    <div className="column-ar">يجب على المستأجر إعادة المركبة بنفس مستوى الوقود الذي استلمها به، وأن تكون نظيفة داخلياً وخارجياً. في حالة الإخلال بنظافة السيارة، تطبق على المستأجر رسوم غسيل وتنظيف إضافية قيمتها 2000 دج.</div>
+                    <div className="column-fr">Le locataire doit restituer le véhicule avec le même niveau de carburant qu'à la livraison et dans un état propre. À défaut, des frais de lavage applicables de 2000 DA seront facturés.</div>
+                  </div>
+                </div>
+
+                <div className="law-section">
+                  <div className="section-title">7. المخالفات والمحشر / Infractions & Fourrière</div>
+                  <div className="bilingual-box">
+                    <div className="column-ar">المستأجر مسؤول مسؤولية مدنية وجزائية كاملة عن جميع المخالفات المرورية وفلاشات الرادار الملتقطة خلال فترة إيجاره للمركبة. وفي حالة وضع المركبة في المحشر البلدي، يتحمل المستأجر وحده جميع مصاريف استخراجها بالإضافة إلى دفع مستحقات أيام التوقف كاملة للوكالة.</div>
+                    <div className="column-fr">Le locataire est pénalement et civilement responsable de toutes les infractions routières et flashs radar durant la période de location. En cas de mise en fourrière, le locataire paie la totalité des frais de récupération ainsi que le montant des jours d'immobilisation du véhicule.</div>
+                  </div>
+                </div>
+
+                <div style={{ background: '#f8fafc', padding: '10px', border: '1px dashed #a0aec0', borderRadius: '4px', fontSize: '11px', marginTop: '15px' }}>
+                  <strong>إقرار وقبول المستأجر:</strong> يقر المستأجر بأنه قد اطلع على كافة الشروط والالتزامات الواردة أعلاه باللغتين العربية والفرنسية، ويوافق عليها موافقة تامة ويلتزم بتطبيقها دون قيد أو شرط بمجرد توقيعه.
+                </div>
+
+                <div className="signatures-table">
+                  <div className="signature-cell">
+                    <strong>توقيع وبصمة المستأجر</strong>
+                    <div className="signature-box"></div>
+                  </div>
+                  <div className="signature-cell">
+                    <strong>ختم وتوقيع الوكالة المعتمد</strong>
+                    <div className="signature-box"></div>
+                  </div>
+                </div>
+                
+                <div style={{ position: 'absolute', bottom: '15px', left: '0', right: '0', textAlign: 'center', fontWeight: 'bold' }}>2/3</div>
               </div>
-            </div>
 
-            <div className="document-title" style={{ marginTop: '15px' }}>الشروط القانونية والتزامات المستأجر (الجزء الأول)</div>
-
-            <div className="law-section">
-              <div className="section-title">1. حالة السيارة والحوادث / État du Véhicule & Accidents</div>
-              <div className="bilingual-box">
-                <div className="column-ar">المستأجر يقر أنه استأجر السيارة في حالة جيدة وبها كامل لوازمها، وفي حالة وقوع أي حادث أو عطب يجب إعلام الوكالة فوراً دون أي تأخير. في حالة حادث أو تحطم، المستأجر ملزم بدفع تكاليف الإصلاح نقداً وفوراً. في حال التضرر الكبير، يتحمل دفع قيمة السيارة بالكامل.</div>
-                <div className="column-fr">Le locataire reconnaît avoir loué le véhicule en bon état et avec tous ses accessoires. En cas d'accident ou de panne, il doit informer l'agence immédiatement. En cas d'accident, le locataire paie les frais de réparation en espèces. Si le dommage est majeur, il est redevable de la valeur totale du véhicule.</div>
+              {/* الورقة 3 */}
+              <div className="print-page">
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', borderBottom: '2px solid black', paddingBottom: '10px', textAlign: 'center' }}>
+                  <div style={{ fontWeight: 'bold', fontSize: '18px' }}>BELAGHA MOTORS FINANCE</div>
+                  <span style={{ fontSize: '11px' }}>وصل استلام مالي رسمي موثق للعميل</span>
+                </div>
+                
+                <div style={{ marginTop: '40px' }}>
+                  <h3 style={{ textAlign: 'center', margin: '0 0 25px 0', fontWeight: 'bold', fontSize: '15px', color: 'black' }}>QUITTANCE DE PAIEMENT / وصل استلام مالي رسمي</h3>
+                  <table className="print-table">
+                    <tbody>
+                      <tr><td style={{ fontWeight: 'bold', backgroundColor: '#f8fafc', width: '35%' }}>التاريخ والوقت الإداري / Date</td><td style={{ fontFamily: 'monospace', fontWeight: 'bold' }}>{printedContract.dateString}</td></tr>
+                      <tr><td style={{ fontWeight: 'bold', backgroundColor: '#f8fafc' }}>استلمنا من السيد(ة) / Client</td><td style={{ fontWeight: 'bold', fontSize: '14px' }}>{printedContract.tenantName}</td></tr>
+                      <tr><td style={{ fontWeight: 'bold', backgroundColor: '#f8fafc' }}>المركبة المؤجرة ومواصفاتها</td><td>{printedContract.carDetails?.brand} {printedContract.carDetails?.model} ({printedContract.carDetails?.plateNumber})</td></tr>
+                      <tr><td style={{ fontWeight: 'bold', backgroundColor: '#f8fafc' }}>مبلغ الكراء الإجمالي المدفوع نقداً</td><td style={{ fontSize: '16px', fontWeight: 'bold', color: '#1a365d' }}>{printedContract.total} دج</td></tr>
+                      <tr><td style={{ fontWeight: 'bold', backgroundColor: '#f8fafc' }}>مبلغ الضمان المودع للوكالة (Caution)</td><td style={{ fontWeight: 'bold', fontSize: '14px' }}>{printedContract.caution} دج</td></tr>
+                    </tbody>
+                  </table>
+                  
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '220px', fontWeight: 'bold', color: 'black' }}>
+                    <div className="signature-cell"><span>توقيع وتأكيد الزبون المستلم</span><div style={{ border: '1px solid #000', height: '85px', marginTop: '10px', borderRadius: '4px', backgroundColor: '#f8fafc' }}></div></div>
+                    <div className="signature-cell"><span>ختم وإمضاء مصلحة الحسابات والمالية</span><div style={{ border: '1px solid #000', height: '85px', marginTop: '10px', borderRadius: '4px', backgroundColor: '#f8fafc' }}></div></div>
+                  </div>
+                </div>
+                <div style={{ position: 'absolute', bottom: '15px', left: '0', right: '0', textAlign: 'center', fontWeight: 'bold' }}>3/3</div>
               </div>
-            </div>
-
-            <div className="law-section">
-              <div className="section-title">2. القيادة والمسؤولية / Conduite & Responsabilité</div>
-              <div className="bilingual-box">
-                <div className="column-ar">لا يسمح بكراء السيارة للغير أو قيادتها من طرف شخص آخر إلا لمن حرر عقد الإيجار باسمه. وفي حالة المخالفة، يحق للوكالة استرجاع السيارة فوراً مع إلغاء العقد ودون إرجاع أي تعويض مالي. كما أنه يمنع منعاً باتاً خروج المركبة خارج التراب الوطني الجزائري.</div>
-                <div className="column-fr">La sous-location ou la conduite du véhicule par une tierce personne non mentionnée dans le présent contrat est strictement interdite. En cas d'infraction, l'agence se réserve le droit de récupérer le véhicule immédiatement sans aucun remboursement. Il est strictement interdit de sortir le véhicule du territoire national.</div>
-              </div>
-            </div>
-
-            <div className="law-section">
-              <div className="section-title">3. التأخير في الإرجاع / Retard de Restitution</div>
-              <div className="bilingual-box">
-                <div className="column-ar">يلتزم المستأجر بإعادة المركبة في الوقت والتاريخ المحددين في العقد. أي تأخير عن موعد إرجاع السيارة يلزم المستأجر تلقائياً بدفع غرامة تأخير قدرها 1500 دج عن كل ساعة تأخير إضافية.</div>
-                <div className="column-fr">Le locataire s'engage à restituer le véhicule à la date et heure convenues. Tout retard dans la restitution entraîne automatiquement une pénalité de 1500 DA par heure de retard.</div>
-              </div>
-            </div>
-
-            <div className="law-section">
-              <div className="section-title">4. السرقة أو الضياع / Perte ou Vol</div>
-              <div className="bilingual-box">
-                <div className="column-ar">في حالة ضياع المركبة أو تعرضها للسرقة، تقع المسؤولية المدنية والكاملة على عاتق المستأجر، حيث يلزم قانوناً بدفع 100% من القيمة المالية الحالية الإجمالية للمركبة للوكالة.</div>
-                <div className="column-fr">En cas de perte ou de vol du véhicule, le locataire est tenu pour seul responsable et doit rembourser 100% de la valeur totale et réelle du véhicule à l'agence.</div>
-              </div>
-            </div>
-
-            <div style={{ position: 'absolute', bottom: '15px', left: '0', right: '0', textAlign: 'center', fontWeight: 'bold' }}>1/3</div>
-          </div>
-
-          {/* الصفحة 2 (2/3): البنود من 5 إلى 7 كاملة ثنائية اللغة والتواقيع والأختام المعزولة */}
-          <div className="print-page">
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', borderBottom: '1px solid black', paddingBottom: '5px', textAlign: 'center' }}>
-              <div style={{ fontWeight: 'bold', fontSize: '16px' }}>BELAGHA MOTORS</div>
-            </div>
-
-            <div className="document-title">تتمة الالتزامات والشروط القانونية (الجزء الثاني) / CONDITIONS GÉNÉRALES</div>
-
-            <div className="law-section">
-              <div className="section-title">5. وثائق ومواقيت العمل / Documents & Heures de Travail</div>
-              <div className="bilingual-box">
-                <div className="column-ar">البطاقة الرمادية الأصلية للمركبة لا تسلم للزبون نهائياً ويتم تسليمه نسخة مصدقة فقط. أوقات العمل الرسمية للوكالة لاستلام وإرجاع المركبات تكون من الساعة (08:00 صباحاً إلى غاية 18:00 مساءً).</div>
-                <div className="column-fr">La carte grise originale du véhicule n'est pas remise au client. Les heures de travail officielles de l'agence pour la réception et la restitution sont de (08:00 à 18:00).</div>
-              </div>
-            </div>
-
-            <div className="law-section">
-              <div className="section-title">6. الوقود والنظافة / Carburant & Propreté</div>
-              <div className="bilingual-box">
-                <div className="column-ar">يجب على المستأجر إعادة المركبة بنفس مستوى الوقود الذي استلمها به، وأن تكون نظيفة داخلياً وخارجياً. في حالة الإخلال بنظافة السيارة، تطبق على المستأجر رسوم غسيل وتنظيف إضافية قيمتها 2000 دج.</div>
-                <div className="column-fr">Le locataire doit restituer le véhicule avec le même niveau de carburant qu'à la livraison et dans un état propre. À défaut, des frais de lavage applicables de 2000 DA seront facturés.</div>
-              </div>
-            </div>
-
-            <div className="law-section">
-              <div className="section-title">7. المخالفات والمحشر / Infractions & Fourrière</div>
-              <div className="bilingual-box">
-                <div className="column-ar">المستأجر مسؤول مسؤولية مدنية وجزائية كاملة عن جميع المخالفات المرورية وفلاشات الرادار الملتقطة خلال فترة إيجاره للمركبة. وفي حالة وضع المركبة في المحشر البلدي، يتحمل المستأجر وحده جميع مصاريف استخراجها بالإضافة إلى دفع مستحقات أيام التوقف كاملة للوكالة.</div>
-                <div className="column-fr">Le locataire est pénalement et civilement responsable de toutes les infractions routières et flashs radar durant la période de location. En cas de mise en fourrière, le locataire paie la totalité des frais de récupération ainsi que le montant des jours d'immobilisation du véhicule.</div>
-              </div>
-            </div>
-
-            <div style={{ background: '#f8fafc', padding: '10px', border: '1px dashed #a0aec0', borderRadius: '4px', fontSize: '11px', marginTop: '15px' }}>
-              <strong>إقرار وقبول المستأجر:</strong> يقر المستأجر بأنه قد اطلع على كافة الشروط والالتزامات الواردة أعلاه باللغتين العربية والفرنسية، ويوافق عليها موافقة تامة ويلتزم بتطبيقها دون قيد أو شرط بمجرد توقيعه.
-            </div>
-
-            <div className="signatures-table">
-              <div className="signature-cell">
-                <strong style={{ color: '#1a365d' }}>توقيع وبصمة المستأجر</strong>
-                <div className="signature-box"></div>
-              </div>
-              <div className="signature-cell">
-                <strong style={{ color: '#1a365d' }}>ختم وتوقيع الوكالة المعتمد</strong>
-                <div className="signature-box"></div>
-              </div>
-            </div>
-            
-            <div style={{ position: 'absolute', bottom: '15px', left: '0', right: '0', textAlign: 'center', fontWeight: 'bold' }}>2/3</div>
-          </div>
-
-          {/* الصفحة 3 (3/3): وصل الاستلام المالي النظيف والمنفصل تماماً (Quittance) */}
-          <div className="print-page">
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', borderBottom: '2px solid black', paddingBottom: '10px', textAlign: 'center' }}>
-              <div style={{ fontWeight: 'bold', fontSize: '18px' }}>BELAGHA MOTORS FINANCE</div>
-              <span style={{ fontSize: '11px' }}>وصل استلام مالي رسمي موثق للعميل</span>
-            </div>
-            
-            <div style={{ marginTop: '40px' }}>
-              <h3 style={{ textAlign: 'center', margin: '0 0 25px 0', fontWeight: 'bold', fontSize: '15px', color: 'black' }}>QUITTANCE DE PAIEMENT / وصل استلام مالي رسمي</h3>
-              <table className="print-table">
-                <tbody>
-                  <tr><td style={{ fontWeight: 'bold', backgroundColor: '#f8fafc', width: '35%' }}>التاريخ والوقت الإداري / Date</td><td style={{ fontFamily: 'monospace', fontWeight: 'bold' }}>{printedContract.dateString}</td></tr>
-                  <tr><td style={{ fontWeight: 'bold', backgroundColor: '#f8fafc' }}>استلمنا من السيد(ة) / Client</td><td style={{ fontWeight: 'bold', fontSize: '14px' }}>{printedContract.tenantName}</td></tr>
-                  <tr><td style={{ fontWeight: 'bold', backgroundColor: '#f8fafc' }}>المركبة المؤجرة ومواصفاتها</td><td>{printedContract.carDetails?.brand} {printedContract.carDetails?.model} ({printedContract.carDetails?.plateNumber})</td></tr>
-                  <tr><td style={{ fontWeight: 'bold', backgroundColor: '#f8fafc' }}>مبلغ الكراء الإجمالي المدفوع نقداً</td><td style={{ fontSize: '16px', fontWeight: 'bold', color: '#1a365d' }}>{printedContract.total} دج</td></tr>
-                  <tr><td style={{ fontWeight: 'bold', backgroundColor: '#f8fafc' }}>مبلغ الضمان المودع للوكالة (Caution)</td><td style={{ fontWeight: 'bold', fontSize: '14px' }}>{printedContract.caution} دج</td></tr>
-                </tbody>
-              </table>
-              
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '220px', fontWeight: 'bold', color: 'black' }}>
-                <div className="signature-cell"><span>توقيع وتأكيد الزبون المستلم</span><div style={{ border: '1px solid #000', height: '85px', marginTop: '10px', borderRadius: '4px', backgroundColor: '#f8fafc' }}></div></div>
-                <div className="signature-cell"><span>ختم وإمضاء مصلحة الحسابات والمالية</span><div style={{ border: '1px solid #000', height: '85px', marginTop: '10px', borderRadius: '4px', backgroundColor: '#f8fafc' }}></div></div>
-              </div>
-            </div>
-            <div style={{ position: 'absolute', bottom: '15px', left: '0', right: '0', textAlign: 'center', fontWeight: 'bold' }}>3/3</div>
-          </div>
-
-        </div>
-      )}
+            </>
+          )}
+      </div>
     </div>
   );
 }
@@ -679,7 +753,7 @@ const styles = {
   fullCoverImage: { width: '100%', height: '100%', objectFit: 'cover' },
   cameraBtn: { backgroundColor: '#7c3aed', color: 'white', border: 'none', padding: '8px 14px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' },
   uploadLabelStandard: { backgroundColor: '#4b5563', color: 'white', padding: '8px 14px', borderRadius: '4px', cursor: 'pointer', fontWeight: 'bold', fontSize: '13px' },
-  uploadLabelBlue: { backgroundColor: '#0284c7', color: 'white', padding: '8px 14px', cursor: 'pointer', display: 'inline-block', fontWeight: 'bold', fontSize: '13px' },
+  uploadLabelBlue: { backgroundColor: '#0284c7', color: 'white', padding: '8px 14px', cursor: 'pointer', display: 'inline-block', fontWeight: 'bold', fontSize: '13px', borderRadius: '4px' },
   formCard: { backgroundColor: 'white', padding: '20px', borderRadius: '8px', boxShadow: '0 4px 6px rgba(0,0,0,0.02)' },
   formGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '15px', marginTop: '10px' },
   formGridCombined: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '15px', borderTop: '1px dashed #e5e7eb', paddingTop: '15px', marginTop: '15px' },
