@@ -6,7 +6,6 @@ const initialFleet = [
   { id: "car_3", brand: "PEUGEOT", model: "2024", year: 2024, plateNumber: "2102-124-25", currentMileage: 135200, status: "available", insuranceExpiryDate: "2026-12-30", oilChangeMileage: 140000, technicalControlDate: "2027-02-10" }
 ];
 
-// وضع مفتاح OpenRouter بأمان في متغير ثابت بداخل الكود
 const OPENROUTER_API_KEY = "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";
 
 function App() {
@@ -15,6 +14,7 @@ function App() {
   const [showAddCarForm, setShowAddCarForm] = useState(false);
   const [isLoadingAI, setIsLoadingAI] = useState(false);
   const [cameraMode, setCameraMode] = useState(null);
+  const [isOcrReady, setIsOcrReady] = useState(false);
 
   const [editingCarId, setEditingCarId] = useState(null);
   const [editMileage, setEditMileage] = useState('');
@@ -24,6 +24,7 @@ function App() {
 
   const videoRef = useRef(null);
   const streamRef = useRef(null);
+  const tesseractWorkerRef = useRef(null);
 
   const [tenantPhoto, setTenantPhoto] = useState(null);
   const [licensePhoto, setLicensePhoto] = useState(null);
@@ -42,6 +43,30 @@ function App() {
   const [calculatedDays, setCalculatedDays] = useState(0);
   const [calculatedTotal, setCalculatedTotal] = useState(0);
   const [printedContract, setPrintedContract] = useState(null);
+
+  // تشغيل المحرك مسبقاً لمنع أي تأخير
+  useEffect(() => {
+    async function initOcr() {
+      try {
+        if (window.Tesseract) {
+          const worker = await window.Tesseract.createWorker();
+          await worker.loadLanguage('eng+fra');
+          await worker.initialize('eng+fra');
+          tesseractWorkerRef.current = worker;
+          setIsOcrReady(true);
+        }
+      } catch (err) {
+        console.error("خطأ تهيئة المحرك:", err);
+      }
+    }
+    initOcr();
+
+    return () => {
+      if (tesseractWorkerRef.current) {
+        tesseractWorkerRef.current.terminate();
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (contractForm.startDate && contractForm.endDate) {
@@ -126,7 +151,7 @@ function App() {
     const dataUrl = canvas.toDataUrl('image/jpeg', 0.85);
 
     if (cameraMode === 'tenant') setTenantPhoto(dataUrl);
-    if (cameraMode === 'license') { setLicensePhoto(dataUrl); executeOpenRouterVisionAI(dataUrl); }
+    if (cameraMode === 'license') { setLicensePhoto(dataUrl); executeHybridOcrAI(dataUrl); }
     if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
     setCameraMode(null);
   };
@@ -138,27 +163,39 @@ function App() {
     reader.onloadend = () => {
       const dataUrl = reader.result;
       if (mode === 'tenant') setTenantPhoto(dataUrl);
-      if (mode === 'license') { setLicensePhoto(dataUrl); executeOpenRouterVisionAI(dataUrl); }
+      if (mode === 'license') { setLicensePhoto(dataUrl); executeHybridOcrAI(dataUrl); }
     };
     reader.readAsDataURL(file);
   };
 
-  // --- دالة الفحص السحابي الخارقة عبر OpenRouter Vision AI لتطهير البيانات نهائياً ---
-  const executeOpenRouterVisionAI = async (base64Image) => {
+  // --- دالة الهندسة الهجينة الخارقة: استخراج محلي سريع + تنظيف ذكي عبر سحابة OpenRouter ---
+  const executeHybridOcrAI = async (base64Image) => {
     setIsLoadingAI(true);
-
+    
     setContractForm(prev => ({
       ...prev,
-      tenantName: "جاري التحليل والمسح الذكي...",
-      licenseNumber: "جاري التحليل والمسح الذكي...",
+      tenantName: "جاري المعالجة بالذكاء الاصطناعي...",
+      licenseNumber: "جاري المعالجة بالذكاء الاصطناعي...",
       birthDatePlace: "",
       licenseIssueDate: ""
     }));
 
     try {
-      // تنظيف ترميز الـ Base64 ليتوافق مع معايير إرسال البيانات للـ API
-      const cleanBase64 = base64Image.split(',')[1];
+      if (!tesseractWorkerRef.current) {
+        alert("محرك المسح يستعد، انتظر لحظة وأعد المحاولة.");
+        setIsLoadingAI(false);
+        return;
+      }
 
+      // 1. استخراج النص الخام محلياً فوراً وبسرعة فائقة لتجنب إرسال الصور الثقيلة
+      const { data: { text } } = await tesseractWorkerRef.current.recognize(base64Image);
+      let rawText = text ? text.toUpperCase() : "";
+
+      if (!rawText.trim()) {
+        throw new Error("لم يتم رصد نصوص في الصورة");
+      }
+
+      // 2. إرسال النص الصافي المكتشف إلى Gemini عبر سحابة OpenRouter لترتيبه وفلترته دون أخطاء
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -166,22 +203,11 @@ function App() {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          model: "google/gemini-2.5-flash", // استخدام نموذج الرؤية الخارق والسرع
+          model: "google/gemini-2.5-flash",
           messages: [
             {
               role: "user",
-              content: [
-                {
-                  type: "text",
-                  text: "Extract data from this Algerian driving license. Return ONLY a valid JSON object matching these keys: tenantName (Latin uppercase fully clean from administrative texts), licenseNumber (the 18-digit ID number), birthDate (format DD.MM.YYYY), issueDate (format DD.MM.YYYY). Do not include markdown codeblocks, output raw JSON only."
-                },
-                {
-                  type: "image_url",
-                  image_url: {
-                    url: `data:image/jpeg;base64,${cleanBase64}`
-                  }
-                }
-              ]
+              content: `Analyze this raw OCR text from an Algerian driving license and clean it perfectly. Fix any typos or mixed characters. Return ONLY a valid JSON object matching these keys: tenantName (Latin clean full name from line 1 & 2), licenseNumber (the exact 18-digit ID number found in the text), birthDate (the date of birth found), issueDate (the driving license issue date). Output pure raw JSON only without markdown or codeblocks.\n\nRaw OCR Text:\n${rawText}`
             }
           ]
         })
@@ -190,7 +216,6 @@ function App() {
       const result = await response.json();
       const aiText = result?.choices?.[0]?.message?.content || "";
       
-      // تنظيف النص المستلم من الـ API في حال وضع حاويات الكود
       const cleanJsonString = aiText.replace(/```json/g, "").replace(/```/g, "").trim();
       const parsedData = JSON.parse(cleanJsonString);
 
@@ -203,8 +228,8 @@ function App() {
       }));
 
     } catch (err) {
-      console.error("خطأ مسح الذكاء الاصطناعي المباشر:", err);
-      // حماية الحقول وتصفيرها تماماً لمنع بقاء أي كاش قديم
+      console.error("عطل بالمعالجة الهجينة للذكاء الاصطناعي:", err);
+      // حماية التصفير عند انقطاع الإنترنت أو الخطأ
       setContractForm(prev => ({ ...prev, tenantName: "", licenseNumber: "", birthDatePlace: "", licenseIssueDate: "" }));
     } finally {
       setIsLoadingAI(false);
@@ -340,12 +365,12 @@ function App() {
         </header>
 
         <div style={styles.apiConfigurationZone}>
-          <span style={{ color: '#166534', fontWeight: 'bold', fontSize: '14px' }}>
-            ⚡ تم تفعيل محرك الذكاء الاصطناعي السحابي المتطور لـ OpenRouter Vision AI بنجاح!
+          <span style={{ color: isOcrReady ? '#166534' : '#b91c1c', fontWeight: 'bold', fontSize: '14px' }}>
+            {isOcrReady ? "⚡ تم دمج نظام الفحص الهجين المتطور المربوط بـ OpenRouter AI بنجاح!" : "⏳ جاري إيقاظ وتدريب المحرك الداخلي الفوري..."}
           </span>
         </div>
 
-        {isLoadingAI && <div style={styles.loadingBanner}>⏳ جاري إرسال الصورة للسيرفر السحابي وتحليل تفاصيل الرخصة بالذكاء الاصطناعي الشامل...</div>}
+        {isLoadingAI && <div style={styles.loadingBanner}>⏳ جاري استخلاص النص وتنظيفه سحابياً عبر ذكاء OpenRouter الخارق...</div>}
 
         {cameraMode && (
           <div style={styles.cameraOverlay}>
@@ -603,7 +628,7 @@ function App() {
                   <div className="section-title">5. وثائق ومواقيت العمل / Documents & Heures de Travail</div>
                   <div className="bilingual-box">
                     <div className="column-ar">البطاقة الرمادية الأصلية للمركبة لا تسلم للزبون نهائياً ويتم تسليمه نسخة مصدقة فقط. أوقات العمل الرسمية للوكالة لاستلام وإرجاع المركبات تكون من الساعة (08:00 صباحاً إلى غاية 18:00 مساءً).</div>
-                    <div className="column-fr">La carte grise originale du véhicule n'est pas remise au client. Les heures de travail officielles de l'agence pour la réception and la restitution sont de (08:00 à 18:00).</div>
+                    <div className="column-fr">La carte grise originale du véhicule n'est pas remise au client. Les heures de travail officielles de l'agence pour la réception et la restitution sont de (08:00 à 18:00).</div>
                   </div>
                 </div>
 
@@ -619,7 +644,7 @@ function App() {
                   <div className="section-title">7. المخالفات والمحشر / Infractions & Fourrière</div>
                   <div className="bilingual-box">
                     <div className="column-ar">المستأجر مسؤول مسؤولية مدنية وجزائية كاملة عن جميع المخالفات المرورية وفلاشات الرادار الملتقطة خلال فترة إيجاره للمركبة. وفي حالة وضع المركبة في المحشر البلدي، يتحمل المستأجر وحده جميع مصاريف استخراجها بالإضافة إلى دفع مستحقات أيام التوقف كاملة للوكالة.</div>
-                    <div className="column-fr">Le locataire est pénalement et civilement responsable de toutes les infractions routières et flashs radar durant la période de location. En cas de mise en fourrière, le locataire paie la totalité des frais de récupération ainsi que le montant des jours d'immobilisation du véhicule.</div>
+                    <div className="column-fr">Le locataire est pénalement et civilement responsable de toutes les infractions routières and flashs radar durant la période de location. En cas de mise en fourrière, le locataire paie la totalité des frais de récupération ainsi que le montant des jours d'immobilisation du véhicule.</div>
                   </div>
                 </div>
 
