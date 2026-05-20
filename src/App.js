@@ -6,8 +6,6 @@ const initialFleet = [
   { id: "car_3", brand: "PEUGEOT", model: "2024", year: 2024, plateNumber: "2102-124-25", currentMileage: 135200, status: "available", insuranceExpiryDate: "2026-12-30", oilChangeMileage: 140000, technicalControlDate: "2027-02-10" }
 ];
 
-const OPENROUTER_API_KEY = "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";
-
 function App() {
   const [fleet, setFleet] = useState(initialFleet);
   const [activeTab, setActiveTab] = useState('new-contract');
@@ -15,6 +13,10 @@ function App() {
   const [isLoadingAI, setIsLoadingAI] = useState(false);
   const [cameraMode, setCameraMode] = useState(null);
   const [isOcrReady, setIsOcrReady] = useState(false);
+
+  // جلب الـ API KEY تلقائياً من ذاكرة المتصفح الآمنة إذا كان مخزناً سابقاً
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('belagha_openrouter_key') || '');
+  const [showKeyStatus, setShowKeyStatus] = useState(false);
 
   const [editingCarId, setEditingCarId] = useState(null);
   const [editMileage, setEditMileage] = useState('');
@@ -44,7 +46,14 @@ function App() {
   const [calculatedTotal, setCalculatedTotal] = useState(0);
   const [printedContract, setPrintedContract] = useState(null);
 
-  // تشغيل المحرك مسبقاً لمنع أي تأخير
+  // حفظ الـ API KEY تلقائياً في ذاكرة التخزين المحلية كلما تم تغييره
+  const saveApiKeyToStorage = (keyFieldValue) => {
+    setApiKey(keyFieldValue);
+    localStorage.setItem('belagha_openrouter_key', keyFieldValue);
+    setShowKeyStatus(true);
+    setTimeout(() => setShowKeyStatus(false), 3000);
+  };
+
   useEffect(() => {
     async function initOcr() {
       try {
@@ -56,7 +65,7 @@ function App() {
           setIsOcrReady(true);
         }
       } catch (err) {
-        console.error("خطأ تهيئة المحرك:", err);
+        console.error("عطل في تهيئة المحرك مسبقاً:", err);
       }
     }
     initOcr();
@@ -168,55 +177,62 @@ function App() {
     reader.readAsDataURL(file);
   };
 
-  // --- دالة الهندسة الهجينة الخارقة: استخراج محلي سريع + تنظيف ذكي عبر سحابة OpenRouter ---
   const executeHybridOcrAI = async (base64Image) => {
+    // التحقق الفوري من إدخال الـ API KEY بداخل حقل التطبيق قبل بدء الفحص لمنع تعطل النظام
+    if (!apiKey.trim()) {
+      alert("⚠️ يرجى إدخال مفتاح الـ API KEY الخاص بـ OpenRouter في الخانة المخصصة بأعلى التطبيق أولاً لتفعيل ميزة الذكاء الاصطناعي!");
+      return;
+    }
+
     setIsLoadingAI(true);
-    
     setContractForm(prev => ({
       ...prev,
-      tenantName: "جاري المعالجة بالذكاء الاصطناعي...",
-      licenseNumber: "جاري المعالجة بالذكاء الاصطناعي...",
+      tenantName: "جاري الاستخلاص والتنظيف الرقمي عبر الـ AI...",
+      licenseNumber: "جاري الاستخلاص والتنظيف الرقمي عبر الـ AI...",
       birthDatePlace: "",
       licenseIssueDate: ""
     }));
 
     try {
       if (!tesseractWorkerRef.current) {
-        alert("محرك المسح يستعد، انتظر لحظة وأعد المحاولة.");
+        alert("محرك المسح يتهيأ، انتظر لحظة وأعد الرفع.");
         setIsLoadingAI(false);
         return;
       }
 
-      // 1. استخراج النص الخام محلياً فوراً وبسرعة فائقة لتجنب إرسال الصور الثقيلة
       const { data: { text } } = await tesseractWorkerRef.current.recognize(base64Image);
       let rawText = text ? text.toUpperCase() : "";
 
-      if (!rawText.trim()) {
-        throw new Error("لم يتم رصد نصوص في الصورة");
-      }
+      const promptInstructions = `You are an expert OCR data cleaner for Algerian driving licenses.
+Analyze the following corrupted OCR text, fix the spelling mistakes caused by camera lighting reflection, and extract the real data.
+Return ONLY a strict raw JSON object with no formatting, markdown, or codeblocks, matching these keys exactly:
+{
+  "tenantName": "CLEAN LATIN FULL NAME IN UPPERCASE",
+  "licenseNumber": "THE 18 DIGIT NATIONAL ID NUMBER",
+  "birthDate": "DD.MM.YYYY",
+  "issueDate": "DD.MM.YYYY"
+}
 
-      // 2. إرسال النص الصافي المكتشف إلى Gemini عبر سحابة OpenRouter لترتيبه وفلترته دون أخطاء
+Raw Corrupted OCR Text:
+${rawText}`;
+
+      // إرسال الطلب سحابياً باستخدام الـ API KEY المدخل عبر واجهة العميل ديناميكياً
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: {
-          "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+          "Authorization": `Bearer ${apiKey}`,
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
           model: "google/gemini-2.5-flash",
-          messages: [
-            {
-              role: "user",
-              content: `Analyze this raw OCR text from an Algerian driving license and clean it perfectly. Fix any typos or mixed characters. Return ONLY a valid JSON object matching these keys: tenantName (Latin clean full name from line 1 & 2), licenseNumber (the exact 18-digit ID number found in the text), birthDate (the date of birth found), issueDate (the driving license issue date). Output pure raw JSON only without markdown or codeblocks.\n\nRaw OCR Text:\n${rawText}`
-            }
-          ]
+          messages: [{ role: "user", content: promptInstructions }]
         })
       });
 
       const result = await response.json();
-      const aiText = result?.choices?.[0]?.message?.content || "";
+      const aiResponseContent = result?.choices?.[0]?.message?.content || "";
       
-      const cleanJsonString = aiText.replace(/```json/g, "").replace(/```/g, "").trim();
+      const cleanJsonString = aiResponseContent.replace(/```json/g, "").replace(/```/g, "").trim();
       const parsedData = JSON.parse(cleanJsonString);
 
       setContractForm(prev => ({
@@ -228,10 +244,9 @@ function App() {
       }));
 
     } catch (err) {
-      console.error("عطل بالمعالجة الهجينة للذكاء الاصطناعي:", err);
-      // حماية التصفير عند انقطاع الإنترنت أو الخطأ
+      console.error("عطل في دالة الفحص الهجينة:", err);
       setContractForm(prev => ({ ...prev, tenantName: "", licenseNumber: "", birthDatePlace: "", licenseIssueDate: "" }));
-    } finally {
+    } finaly {
       setIsLoadingAI(false);
     }
   };
@@ -292,6 +307,7 @@ function App() {
   return (
     <div style={styles.appContainer} dir="rtl">
       
+      {/* ستايل العزل التام لهيكلية صفحات الطباعة الثلاث والعلامة المائية للأجهزة اللوحية */}
       <style dangerouslySetInnerHTML={{__html: `
         @media screen {
           .print-only-layout { display: none !important; }
@@ -304,7 +320,7 @@ function App() {
             margin: 0 !important; padding: 0 !important; width: 100% !important; height: auto !important;
           }
           .screen-only-layout, .no-print { display: none !important; }
-          .print-only-layout { display: block !important; width: 100% !important; }
+          .print-only-layout { display: block !important; }
           
           .print-page {
             display: block !important; box-sizing: border-box !important; page-break-after: always !important;
@@ -364,13 +380,27 @@ function App() {
           </div>
         </header>
 
+        {/* حقل الإدخال الجديد الفخم المخصص لإدخال وحفظ الـ API KEY مباشرة من التطبيق */}
         <div style={styles.apiConfigurationZone}>
-          <span style={{ color: isOcrReady ? '#166534' : '#b91c1c', fontWeight: 'bold', fontSize: '14px' }}>
-            {isOcrReady ? "⚡ تم دمج نظام الفحص الهجين المتطور المربوط بـ OpenRouter AI بنجاح!" : "⏳ جاري إيقاظ وتدريب المحرك الداخلي الفوري..."}
-          </span>
+          <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+            <label style={{ fontWeight: 'bold', fontSize: '13px', color: '#334155' }}>مفتاح الذكاء الاصطناعي (OpenRouter API KEY):</label>
+            <input 
+              type="password" 
+              placeholder="أدخل المفتاح هنا sk-or-v1-..." 
+              value={apiKey} 
+              onChange={(e) => saveApiKeyToStorage(e.target.value)} 
+              style={styles.apiKeyInput}
+            />
+            {apiKey.trim() ? (
+              <span style={{ color: '#166534', fontWeight: 'bold', fontSize: '12px' }}>🔒 متصل ومحفوظ تلقائياً</span>
+            ) : (
+              <span style={{ color: '#b91c1c', fontWeight: 'bold', fontSize: '12px' }}>⚠️ يرجى إدخال المفتاح لتنشيط الفحص</span>
+            )}
+            {showKeyStatus && <span style={{ color: '#2563eb', fontSize: '12px', fontWeight: 'bold' }}>🔄 تم التحديث بنجاح!</span>}
+          </div>
         </div>
 
-        {isLoadingAI && <div style={styles.loadingBanner}>⏳ جاري استخلاص النص وتنظيفه سحابياً عبر ذكاء OpenRouter الخارق...</div>}
+        {isLoadingAI && <div style={styles.loadingBanner}>⏳ جاري استخلاص النص الموضعي وإصلاحه سحابياً عبر نموذج Gemini المتطور...</div>}
 
         {cameraMode && (
           <div style={styles.cameraOverlay}>
@@ -500,7 +530,7 @@ function App() {
                   <label style={styles.uploadLabelStandard}>📂 اختيار ملف جاهز<input type="file" accept="image/*" onChange={(e) => handleFileUpload(e, 'tenant')} style={{display:'none'}}/></label>
                 </div>
 
-                <h3 style={{marginTop:'20px'}}>2. قراءة رخصة السياقة بالذكاء الاصطناعي (محدث ومحمي)</h3>
+                <h3 style={{marginTop:'20px'}}>2. قراءة رخصة السياقة بالذكاء الاصطناعي (الهجين المطور)</h3>
                 <div style={styles.cameraBox}>
                   <div style={styles.cameraView}>{licensePhoto ? <img src={licensePhoto} alt="الرخصة" style={styles.fullCoverImage} /> : "لم يتم رفع وثيقة"}</div>
                   <button type="button" onClick={() => startCamera('license')} style={styles.cameraBtn}>⚡ مسح بالكاميرا</button>
@@ -636,7 +666,7 @@ function App() {
                   <div className="section-title">6. الوقود والنظافة / Carburant & Propreté</div>
                   <div className="bilingual-box">
                     <div className="column-ar">يجب على المستأجر إعادة المركبة بنفس مستوى الوقود الذي استلمها به، وأن تكون نظيفة داخلياً وخارجياً. في حالة الإخلال بنظافة السيارة, تطبق على المستأجر رسوم غسيل وتنظيف إضافية قيمتها 2000 دج.</div>
-                    <div className="column-fr">Le locataire doit restituer le véhicule avec le même niveau de carburant qu'à la livraison et dans un état propre. À défaut, des frais de lavage applicables de 2000 DA seront facturés.</div>
+                    <div className="column-fr">Le locataire doit restituer le véhicule avec le même niveau de carburant qu'à la livraison et dans un état propre. À défaut, des frais de lavage applicables de 2000 DA werden facturés.</div>
                   </div>
                 </div>
 
@@ -644,7 +674,7 @@ function App() {
                   <div className="section-title">7. المخالفات والمحشر / Infractions & Fourrière</div>
                   <div className="bilingual-box">
                     <div className="column-ar">المستأجر مسؤول مسؤولية مدنية وجزائية كاملة عن جميع المخالفات المرورية وفلاشات الرادار الملتقطة خلال فترة إيجاره للمركبة. وفي حالة وضع المركبة في المحشر البلدي، يتحمل المستأجر وحده جميع مصاريف استخراجها بالإضافة إلى دفع مستحقات أيام التوقف كاملة للوكالة.</div>
-                    <div className="column-fr">Le locataire est pénalement et civilement responsable de toutes les infractions routières and flashs radar durant la période de location. En cas de mise en fourrière, le locataire paie la totalité des frais de récupération ainsi que le montant des jours d'immobilisation du véhicule.</div>
+                    <div className="column-fr">Le locataire est pénalement et civilement responsable de toutes les infractions routières et flashs radar durant la période de location. En cas de mise en fourrière, le locataire paie la totalité des frais de récupération ainsi que le montant des jours d'immobilisation du véhicule.</div>
                   </div>
                 </div>
 
@@ -704,7 +734,8 @@ const styles = {
   header: { backgroundColor: '#1e293b', color: '#fff', padding: '15px 30px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
   mainTitleText: { fontSize: '20px', margin: 0, fontWeight: 'bold' },
   navBtn: { color: 'white', border: 'none', padding: '8px 16px', borderRadius: '6px', cursor: 'pointer', backgroundColor: '#3b82f6', marginLeft: '5px', fontWeight: 'bold' },
-  apiConfigurationZone: { padding: '15px 30px', backgroundColor: '#e2e8f0', borderBottom: '1px solid #cbd5e1', textAlign: 'center' },
+  apiConfigurationZone: { padding: '12px 30px', backgroundColor: '#f1f5f9', borderBottom: '1px solid #cbd5e1', textAlign: 'center' },
+  apiKeyInput: { padding: '8px 12px', width: '320px', border: '1px solid #cbd5e1', borderRadius: '6px', fontSize: '13px', direction: 'ltr', textAlign: 'center' },
   loadingBanner: { backgroundColor: '#7c3aed', color: 'white', textAlign: 'center', padding: '12px', fontWeight: 'bold', fontSize: '14px' },
   cameraOverlay: { position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', backgroundColor: 'rgba(0,0,0,0.8)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 },
   cameraModal: { backgroundColor: 'white', padding: '20px', borderRadius: '12px', width: '90%', maxWidth: '500px' },
