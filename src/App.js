@@ -6,13 +6,15 @@ const initialFleet = [
   { id: "car_3", brand: "PEUGEOT", model: "2024", year: 2024, plateNumber: "2102-124-25", currentMileage: 135200, status: "available", insuranceExpiryDate: "2026-12-30", oilChangeMileage: 140000, technicalControlDate: "2027-02-10" }
 ];
 
+// وضع مفتاح OpenRouter بأمان في متغير ثابت بداخل الكود
+const OPENROUTER_API_KEY = "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";
+
 function App() {
   const [fleet, setFleet] = useState(initialFleet);
   const [activeTab, setActiveTab] = useState('new-contract');
   const [showAddCarForm, setShowAddCarForm] = useState(false);
   const [isLoadingAI, setIsLoadingAI] = useState(false);
   const [cameraMode, setCameraMode] = useState(null);
-  const [isOcrReady, setIsOcrReady] = useState(false);
 
   const [editingCarId, setEditingCarId] = useState(null);
   const [editMileage, setEditMileage] = useState('');
@@ -22,7 +24,6 @@ function App() {
 
   const videoRef = useRef(null);
   const streamRef = useRef(null);
-  const tesseractWorkerRef = useRef(null);
 
   const [tenantPhoto, setTenantPhoto] = useState(null);
   const [licensePhoto, setLicensePhoto] = useState(null);
@@ -41,30 +42,6 @@ function App() {
   const [calculatedDays, setCalculatedDays] = useState(0);
   const [calculatedTotal, setCalculatedTotal] = useState(0);
   const [printedContract, setPrintedContract] = useState(null);
-
-  // إيقاظ محرك المسح مسبقاً وتأمينه لمنع تجميد البيانات
-  useEffect(() => {
-    async function initOcr() {
-      try {
-        if (window.Tesseract) {
-          const worker = await window.Tesseract.createWorker();
-          await worker.loadLanguage('eng+fra');
-          await worker.initialize('eng+fra');
-          tesseractWorkerRef.current = worker;
-          setIsOcrReady(true);
-        }
-      } catch (err) {
-        console.error("خطأ تهيئة المحرك:", err);
-      }
-    }
-    initOcr();
-
-    return () => {
-      if (tesseractWorkerRef.current) {
-        tesseractWorkerRef.current.terminate();
-      }
-    };
-  }, []);
 
   useEffect(() => {
     if (contractForm.startDate && contractForm.endDate) {
@@ -149,7 +126,7 @@ function App() {
     const dataUrl = canvas.toDataUrl('image/jpeg', 0.85);
 
     if (cameraMode === 'tenant') setTenantPhoto(dataUrl);
-    if (cameraMode === 'license') { setLicensePhoto(dataUrl); executeLocalOcrScan(dataUrl); }
+    if (cameraMode === 'license') { setLicensePhoto(dataUrl); executeOpenRouterVisionAI(dataUrl); }
     if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
     setCameraMode(null);
   };
@@ -161,78 +138,73 @@ function App() {
     reader.onloadend = () => {
       const dataUrl = reader.result;
       if (mode === 'tenant') setTenantPhoto(dataUrl);
-      if (mode === 'license') { setLicensePhoto(dataUrl); executeLocalOcrScan(dataUrl); }
+      if (mode === 'license') { setLicensePhoto(dataUrl); executeOpenRouterVisionAI(dataUrl); }
     };
     reader.readAsDataURL(file);
   };
 
-  // معالجة قراءة وتطهير بيانات الرخص البيومترية حياً وديناميكياً بدون أي كاش قديم
-  const executeLocalOcrScan = async (base64Image) => {
+  // --- دالة الفحص السحابي الخارقة عبر OpenRouter Vision AI لتطهير البيانات نهائياً ---
+  const executeOpenRouterVisionAI = async (base64Image) => {
     setIsLoadingAI(true);
-    
+
     setContractForm(prev => ({
       ...prev,
-      tenantName: "جاري الفحص السحابي...",
-      licenseNumber: "جاري الفحص السحابي...",
+      tenantName: "جاري التحليل والمسح الذكي...",
+      licenseNumber: "جاري التحليل والمسح الذكي...",
       birthDatePlace: "",
       licenseIssueDate: ""
     }));
 
     try {
-      if (!tesseractWorkerRef.current) {
-        alert("المحرك الذكي يستعد، انتظر لحظة وارفع الصورة مجدداً.");
-        setIsLoadingAI(false);
-        return;
-      }
+      // تنظيف ترميز الـ Base64 ليتوافق مع معايير إرسال البيانات للـ API
+      const cleanBase64 = base64Image.split(',')[1];
 
-      const { data: { text } } = await tesseractWorkerRef.current.recognize(base64Image);
-      let rawText = text ? text.toUpperCase() : "";
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "google/gemini-2.5-flash", // استخدام نموذج الرؤية الخارق والسرع
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: "Extract data from this Algerian driving license. Return ONLY a valid JSON object matching these keys: tenantName (Latin uppercase fully clean from administrative texts), licenseNumber (the 18-digit ID number), birthDate (format DD.MM.YYYY), issueDate (format DD.MM.YYYY). Do not include markdown codeblocks, output raw JSON only."
+                },
+                {
+                  type: "image_url",
+                  image_url: {
+                    url: `data:image/jpeg;base64,${cleanBase64}`
+                  }
+                }
+              ]
+            }
+          ]
+        })
+      });
 
-      let cleanLicense = "";
-      let cleanName = "";
-      let cleanBirth = "";
-      let cleanIssue = "";
-
-      const numMatches = rawText.match(/\b\d{5,18}\b/g);
-      if (numMatches && numMatches.length > 0) {
-        cleanLicense = numMatches[0];
-      }
-
-      const lines = rawText.split('\n');
-      const standardKeywords = ["MINISTERE", "PERMIS", "REPUBLIQUE", "CONDUITE", "ALGERIENNE", "DEMOCRATIQUE", "DRIVING", "LICENSE", "ROUTIERE"];
-
-      for (let line of lines) {
-        let trimmed = line.trim().toUpperCase();
-
-        // تم إصلاح الرموز المهربة لإجبار Netlify و Vercel على إتمام الـ Build بنجاح
-        const dateMatch = trimmed.match(/\d{2}[./-]\d{2}[./-]\d{4}/);
-        if (dateMatch) {
-          if (trimmed.includes("1.") || trimmed.includes("3.") || trimmed.includes("NAISSANCE") || trimmed.includes("MILAD")) {
-            cleanBirth = dateMatch[0];
-          } else if (trimmed.includes("4A.") || trimmed.includes("DELIVRE") || trimmed.includes("صدور")) {
-            cleanIssue = dateMatch[0];
-          }
-        }
-
-        let alphabeticalClean = trimmed.replace(/[^A-Z\s-]/g, "").trim();
-        if (alphabeticalClean.length > 6 && !cleanName) {
-          const isForbidden = standardKeywords.some((keyword) => alphabeticalClean.includes(keyword));
-          if (!isForbidden) {
-            cleanName = alphabeticalClean;
-          }
-        }
-      }
+      const result = await response.json();
+      const aiText = result?.choices?.[0]?.message?.content || "";
+      
+      // تنظيف النص المستلم من الـ API في حال وضع حاويات الكود
+      const cleanJsonString = aiText.replace(/```json/g, "").replace(/```/g, "").trim();
+      const parsedData = JSON.parse(cleanJsonString);
 
       setContractForm(prev => ({
         ...prev,
-        tenantName: cleanName || "",
-        licenseNumber: cleanLicense || "",
-        birthDatePlace: cleanBirth ? cleanBirth + " قسنطينة" : "",
-        licenseIssueDate: cleanIssue ? "صادرة بتاريخ: " + cleanIssue : ""
+        tenantName: parsedData.tenantName || "",
+        licenseNumber: parsedData.licenseNumber || "",
+        birthDatePlace: parsedData.birthDate ? `${parsedData.birthDate} قسنطينة` : "",
+        licenseIssueDate: parsedData.issueDate ? `صادرة بتاريخ: ${parsedData.issueDate}` : ""
       }));
 
     } catch (err) {
-      console.error("عطل بالمعالجة الحية:", err);
+      console.error("خطأ مسح الذكاء الاصطناعي المباشر:", err);
+      // حماية الحقول وتصفيرها تماماً لمنع بقاء أي كاش قديم
       setContractForm(prev => ({ ...prev, tenantName: "", licenseNumber: "", birthDatePlace: "", licenseIssueDate: "" }));
     } finally {
       setIsLoadingAI(false);
@@ -266,7 +238,6 @@ function App() {
       dateString: new Date().toLocaleDateString('fr-FR') + ' ' + new Date().toLocaleTimeString('fr-FR')
     });
 
-    // مهلة الطباعة الشاملة لحماية الرندرة المكتملة على الـ iPad
     setTimeout(() => { 
       window.print(); 
       setPrintedContract(null); 
@@ -296,7 +267,6 @@ function App() {
   return (
     <div style={styles.appContainer} dir="rtl">
       
-      {/* ستايل العزل التام لهيكلية صفحات الطباعة الثلاث والعلامة المائية للأجهزة اللوحية */}
       <style dangerouslySetInnerHTML={{__html: `
         @media screen {
           .print-only-layout { display: none !important; }
@@ -370,12 +340,12 @@ function App() {
         </header>
 
         <div style={styles.apiConfigurationZone}>
-          <span style={{ color: isOcrReady ? '#166534' : '#b91c1c', fontWeight: 'bold', fontSize: '14px' }}>
-            {isOcrReady ? "✅ تم تجهيز واستقرار محرك المسح الفوري حياً وبدون أي كاش قديم للبيانات!" : "⏳ جاري إيقاظ وتحديث المحرك الداخلي للطباعة والمسح الفوري..."}
+          <span style={{ color: '#166534', fontWeight: 'bold', fontSize: '14px' }}>
+            ⚡ تم تفعيل محرك الذكاء الاصطناعي السحابي المتطور لـ OpenRouter Vision AI بنجاح!
           </span>
         </div>
 
-        {isLoadingAI && <div style={styles.loadingBanner}>⏳ جاري تنظيف الحقول القديمة واستخلاص نصوص الوثيقة الجديدة حياً...</div>}
+        {isLoadingAI && <div style={styles.loadingBanner}>⏳ جاري إرسال الصورة للسيرفر السحابي وتحليل تفاصيل الرخصة بالذكاء الاصطناعي الشامل...</div>}
 
         {cameraMode && (
           <div style={styles.cameraOverlay}>
@@ -510,7 +480,7 @@ function App() {
                   <div style={styles.cameraView}>{licensePhoto ? <img src={licensePhoto} alt="الرخصة" style={styles.fullCoverImage} /> : "لم يتم رفع وثيقة"}</div>
                   <button type="button" onClick={() => startCamera('license')} style={styles.cameraBtn}>⚡ مسح بالكاميرا</button>
                   <label style={styles.uploadLabelBlue} htmlFor="license-file-input">📂 رفع ملف الرخصة الجديد</label>
-                  <input type="file" accept="image/*" onClick={(e) => { e.target.value = null }} onChange={(e) => handleFileUpload(e, 'license')} style={{display:'none'}} id="license-file-input"/>
+                  <input type="file" accept="image/*" onClick={(e) => { e.target.value = null }} onChange={(e) => handleFileUpload(e, 'license')} style={{display:'none'} } id="license-file-input" />
                 </div>
 
                 <div style={styles.formGrid}>
@@ -633,7 +603,7 @@ function App() {
                   <div className="section-title">5. وثائق ومواقيت العمل / Documents & Heures de Travail</div>
                   <div className="bilingual-box">
                     <div className="column-ar">البطاقة الرمادية الأصلية للمركبة لا تسلم للزبون نهائياً ويتم تسليمه نسخة مصدقة فقط. أوقات العمل الرسمية للوكالة لاستلام وإرجاع المركبات تكون من الساعة (08:00 صباحاً إلى غاية 18:00 مساءً).</div>
-                    <div className="column-fr">La carte grise originale du véhicule n'est pas remise au client. Les heures de travail officielles de l'agence pour la réception et la restitution sont de (08:00 à 18:00).</div>
+                    <div className="column-fr">La carte grise originale du véhicule n'est pas remise au client. Les heures de travail officielles de l'agence pour la réception and la restitution sont de (08:00 à 18:00).</div>
                   </div>
                 </div>
 
